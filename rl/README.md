@@ -33,20 +33,20 @@ These parameters allow for seamless tracking, visualization, and comparison of t
 
 To visualize and compare the performance of different algorithms and configurations, we use a forked version of OpenRLBenchmark. Clone the repository, follow the instal step, and run the following command to generate performance curves from your W&B experiments:
 ```
-python -m openrlbenchmark.rlops
---filters '?we=jogima-cyber&wpn=rs-rl&ceik=env_id&cen=exp_name&metric=charts/episodic_return'
-'ppo'
-'ddpg'
-'td3'
-'rs-ddpg-explo-noise-rs-samples10-rs-noise0.01'
-'rs-td3-explo-noise-rs-samples10-rs-noise0.005'
-'lse-ddpg-lse-samples10-rs-noise0.1'
-'lse-td3-lse-samples10-rs-noise0.1'
---env-ids Ant-v4 Hopper-v4 Humanoid-v4 Walker2d-v4 HalfCheetah-v4 Pusher-v4 InvertedPendulum-v4
---rliable
---rc.sample_efficiency_and_walltime_efficiency_method Mean
---output-filename rs-rl-2/compare
---report
+python -m openrlbenchmark.rlops \
+    --filters '?we=jogima-cyber&wpn=rs-rl&ceik=env_id&cen=exp_name&metric=charts/episodic_return' \
+    'ppo' \
+    'ddpg' \
+    'td3' \
+    'rs-ddpg-explo-noise-rs-samples10-rs-noise0.01' \
+    'rs-td3-explo-noise-rs-samples10-rs-noise0.005' \
+    'lse-ddpg-lse-samples10-rs-noise0.1' \
+    'lse-td3-lse-samples10-rs-noise0.1' \
+    --env-ids Ant-v4 Hopper-v4 Humanoid-v4 Walker2d-v4 HalfCheetah-v4 Pusher-v4 InvertedPendulum-v4 \
+    --rliable \
+    --rc.sample_efficiency_and_walltime_efficiency_method Mean \
+    --output-filename rs-rl-2/compare \
+    --report
 ```
 
 **Customization Notes**:
