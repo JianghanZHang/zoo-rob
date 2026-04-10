@@ -299,19 +299,30 @@ if __name__ == "__main__":
             next_obs = torch.Tensor(next_obs_np).to(device)
             next_done = torch.Tensor(next_done_np.astype(np.float32)).to(device)
 
-            # Log episode returns
-            if "final_info" in infos:
+            # Log episode returns (gymnasium >=1.0 puts 'episode' directly in infos)
+            if "episode" in infos:
+                # infos["episode"] is a dict with arrays: {"r": [...], "l": [...]}
+                # "_episode" mask tells us which envs just finished
+                done_mask = infos.get("_episode", next_done_np)
+                for i, done in enumerate(done_mask):
+                    if done:
+                        ep_r = float(infos["episode"]["r"][i])
+                        ep_l = int(infos["episode"]["l"][i])
+                        writer.add_scalar("charts/episodic_return",
+                                          ep_r, global_step)
+                        writer.add_scalar("charts/episodic_length",
+                                          ep_l, global_step)
+                        print(f"  step={global_step:>8d}  "
+                              f"ep_return={ep_r:.1f}  ep_len={ep_l}",
+                              flush=True)
+            elif "final_info" in infos:
+                # Fallback for older gymnasium
                 for info in infos["final_info"]:
                     if info is not None and "episode" in info:
                         writer.add_scalar("charts/episodic_return",
                                           info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length",
                                           info["episode"]["l"], global_step)
-                        if update % 5 == 0:
-                            print(f"  step={global_step:>8d}  "
-                                  f"ep_return={info['episode']['r']:.1f}  "
-                                  f"ep_len={info['episode']['l']}",
-                                  flush=True)
 
         # Bootstrap value (Paper Algorithm 1, line 3)
         with torch.no_grad():
