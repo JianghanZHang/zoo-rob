@@ -59,9 +59,10 @@ class Args:
     lr_omega: float = 1e-3
 
     # TD-omega
-    N: int = 8
+    N: int = 32
     gamma: float = 0.99
     learn_omega: bool = True
+    state_dependent_omega: bool = False
     fixed_lambda: float = 0.95  # used when learn_omega=False
 
     # Three-timescale update counts
@@ -91,23 +92,39 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs, N=8):
+    def __init__(self, envs, N=8, state_dependent_omega=False):
         super().__init__()
         obs_dim = np.array(envs.single_observation_space.shape).prod()
         act_dim = np.prod(envs.single_action_space.shape)
+        self.N = N
+        self.state_dependent_omega = state_dependent_omega
 
+        # Critic (value function)
         self.critic = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 256)), nn.Tanh(),
             layer_init(nn.Linear(256, 256)), nn.Tanh(),
             layer_init(nn.Linear(256, 1), std=1.0),
         )
+
+        # Actor (policy)
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 256)), nn.Tanh(),
             layer_init(nn.Linear(256, 256)), nn.Tanh(),
             layer_init(nn.Linear(256, act_dim), std=0.01),
         )
         self.actor_logstd = nn.Parameter(torch.zeros(1, act_dim))
-        self.omega_logits = nn.Parameter(torch.zeros(N))
+
+        # Omega (evaluation operator design)
+        if state_dependent_omega:
+            # ω(s): state-dependent — different states get different evaluation horizons
+            # Tiny network: obs → 16 hidden → N logits (~300 params, not 3000)
+            self.omega_net = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, 16)), nn.Tanh(),
+                layer_init(nn.Linear(16, N), std=0.01),
+            )
+        else:
+            # Global ω: shared across all states
+            self.omega_logits = nn.Parameter(torch.zeros(N))
 
     def get_value(self, x):
         return self.critic(x)
@@ -120,8 +137,24 @@ class Agent(nn.Module):
             action = probs.sample()
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
 
+    def get_omega(self, x=None):
+        """Get omega weights, optionally conditioned on state.
+
+        Returns: (N,) if global, (T, N) if state-dependent and x is (T, obs_dim).
+        """
+        if self.state_dependent_omega:
+            assert x is not None, "state_dependent_omega requires observations"
+            logits = self.omega_net(x)  # (T, N) or (obs_dim,) -> (N,)
+            return F.softmax(logits, dim=-1)
+        else:
+            return F.softmax(self.omega_logits, dim=0)
+
     @property
     def omega(self):
+        """Global omega (for logging). Use get_omega(x) for state-dependent."""
+        if self.state_dependent_omega:
+            # Return mean omega (not meaningful, but useful for logging)
+            return F.softmax(self.omega_net[0].weight.mean(dim=1), dim=0)
         return F.softmax(self.omega_logits, dim=0)
 
 
@@ -208,10 +241,11 @@ if __name__ == "__main__":
         for _ in range(args.num_envs)])
     assert isinstance(envs.single_action_space, gym.spaces.Box)
 
-    agent = Agent(envs, N=args.N).to(device)
+    agent = Agent(envs, N=args.N,
+                  state_dependent_omega=args.state_dependent_omega).to(device)
 
     # If fixed omega, set to geometric and freeze
-    if not args.learn_omega:
+    if not args.learn_omega and not args.state_dependent_omega:
         with torch.no_grad():
             lam = args.fixed_lambda
             w = np.array([(1-lam)*lam**(n-1) for n in range(1, args.N+1)])
@@ -223,8 +257,14 @@ if __name__ == "__main__":
         list(agent.actor_mean.parameters()) + [agent.actor_logstd],
         lr=args.lr_actor)
     critic_optimizer = optim.Adam(agent.critic.parameters(), lr=args.lr_critic)
-    omega_optimizer = optim.Adam(
-        [agent.omega_logits], lr=args.lr_omega) if args.learn_omega else None
+
+    # Omega optimizer: either global logits or state-dependent network
+    if args.learn_omega or args.state_dependent_omega:
+        omega_params = list(agent.omega_net.parameters()) if args.state_dependent_omega \
+            else [agent.omega_logits]
+        omega_optimizer = optim.Adam(omega_params, lr=args.lr_omega)
+    else:
+        omega_optimizer = None
 
     # Normalization
     obs_rms = RunningMeanStd(envs.single_observation_space.shape) if args.norm_obs else None
@@ -334,28 +374,36 @@ if __name__ == "__main__":
         b_dones = dones.reshape(-1)
         b_values = torch.cat([values.reshape(-1), next_value.reshape(-1)])
 
-        # ── Omega update: shape the resolvent (Paper Algorithm 1, lines 12-16) ──
+        # Precompute all n-step returns (shared across omega/critic/actor updates)
+        G_list = [compute_nstep_returns(b_rewards, b_values, b_dones,
+                                        args.gamma, n)
+                  for n in range(1, args.N + 1)]
+        G_stack = torch.stack(G_list)  # (N, T)
+
+        def compute_F_omega(omega_weights):
+            """Compute omega-weighted target. Handles both global and state-dependent."""
+            if omega_weights.dim() == 1:
+                # Global: omega is (N,), G is (N, T)
+                return torch.einsum('n,nt->t', omega_weights, G_stack)
+            else:
+                # State-dependent: omega is (T, N), G is (N, T)
+                return torch.einsum('tn,nt->t', omega_weights, G_stack)
+
+        # ── Omega update: shape the resolvent ──
         if omega_optimizer is not None:
             for _ in range(args.omega_epochs):
-                omega = agent.omega
-                G_list = [compute_nstep_returns(b_rewards, b_values, b_dones,
-                                                args.gamma, n)
-                          for n in range(1, args.N + 1)]
-                G_stack = torch.stack(G_list)
-                F_omega = torch.einsum('n,nt->t', omega, G_stack)
+                omega = agent.get_omega(b_obs)
+                F_omega = compute_F_omega(omega)
                 omega_loss = ((F_omega - b_values[:-1].detach()) ** 2).mean()
 
                 omega_optimizer.zero_grad()
                 omega_loss.backward()
                 omega_optimizer.step()
 
-        # ── Critic update: fit V to omega-weighted target (Paper lines 17-19) ──
+        # ── Critic update: fit V to omega-weighted target ──
         with torch.no_grad():
-            omega = agent.omega
-            G_list = [compute_nstep_returns(b_rewards, b_values, b_dones,
-                                            args.gamma, n)
-                      for n in range(1, args.N + 1)]
-            targets = torch.einsum('n,nt->t', omega, torch.stack(G_list))
+            omega = agent.get_omega(b_obs)
+            targets = compute_F_omega(omega)
 
         for _ in range(args.critic_epochs):
             v = agent.get_value(b_obs).squeeze(-1)
@@ -389,7 +437,12 @@ if __name__ == "__main__":
             actor_optimizer.step()
 
         # ── Logging ──
-        omega_np = agent.omega.detach().cpu().numpy()
+        with torch.no_grad():
+            omega_log = agent.get_omega(b_obs)
+            if omega_log.dim() > 1:
+                omega_np = omega_log.mean(dim=0).cpu().numpy()  # mean across states
+            else:
+                omega_np = omega_log.cpu().numpy()
         writer.add_scalar("losses/value_loss", critic_loss.item(), global_step)
         writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
         if omega_optimizer is not None:

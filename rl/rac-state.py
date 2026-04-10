@@ -61,8 +61,8 @@ class Args:
     # TD-omega
     N: int = 32
     gamma: float = 0.99
-    learn_omega: bool = False
-    state_dependent_omega: bool = False
+    learn_omega: bool = True
+    state_dependent_omega: bool = True
     fixed_lambda: float = 0.95  # used when learn_omega=False
 
     # Three-timescale update counts
